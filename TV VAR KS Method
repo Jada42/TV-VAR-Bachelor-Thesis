@@ -1,0 +1,470 @@
+#------------------------------------
+#------- Install Packages -----------
+#------------------------------------
+
+library(mgm)
+library(lubridate)
+library(ggplot2)
+library(ggfortify)
+library(qgraph)
+library(readr)
+library(mgcv)
+library(devtools)
+library(dplyr)
+library(forecast)
+library(tseries)
+library(urca)
+#install.packages("remotes")
+remove.packages("tvvarGAM")
+install_github("LauraBringmann/tvvarGAM")
+
+
+figDir <- ("") set your working directory
+
+#------------------------------------
+#------- Read/Import Data -----------
+#------------------------------------
+
+# data2 <- read_csv("~//P001-raw.csv")
+data <- read_csv("~/Downloads/P001.csv") # Same dataset, just with cleaned dayvar and beepvar
+View(data)
+
+#------------------------------------
+#------- Inspect Datasets -----------
+#------------------------------------
+
+head(data)
+
+#------------------------------------
+#------- Subset Variables -----------
+#------------------------------------
+
+mood_data <- as.matrix(data[, 3:16])
+mood_data <- mood_data[,-12:-13]
+mood_data <- mood_data[,-9]
+
+
+time_data <- data[,19:22]
+
+
+
+#------------------------------------
+#------- Rename Columns -------------
+#------------------------------------
+
+##Add column as date (unaggregated) and add time data
+
+names<-scan("names(mood_labels_p001).txt",what = "character", sep = "\n")
+
+mood_labels <- colnames(mood_data)
+
+head(time_data)
+
+head(mood_data)
+
+dim(mood_data)
+
+mood_data[is.na(mood_data)]<- 0 # removing NA's
+na.omit(mood_data)
+
+### Additional Plots,Plot of Variables, Autocorrelation, Difference of Autocorrelation, 
+
+# autoplot(mood_data) + ggtitle("Mood Variables P001") + labs(x ="Time", y= "Moods")
+# ggAcf(mood_data) + ggtitle("ACF of Mood Variables")
+# dind <- diff(mood_data)
+# ggAcf(dind) + ggtitle("Difference of ACF of Mood Variables")
+# summary(mood_data)
+
+
+bwSeq <- seq(0.01, 1, length = 10)
+
+set.seed(1)
+bw_object <- bwSelect(data = mood_data,
+                      type = rep("g", 11),
+                      level = rep(1, 11),
+                      bwSeq = bwSeq,
+                      bwFolds = 1,
+                      bwFoldsize = 10,
+                      modeltype = "mvar",
+                      lags = 1,
+                      scale = TRUE,
+                      #timepoints = timepoint,
+                      beepvar = data$beep_var,
+                      dayvar = data$day_var,
+                      pbar = TRUE)
+
+bandwidth <- bwSeq[which.min(bw_object$meanError)]
+
+bandwidth <- .23
+
+
+
+# Estimate Model on Full Dataset
+set.seed(1)
+tvvar_obj <- tvmvar(data = mood_data,
+                    type = rep("g", 11),
+                    level = rep(1, 11), 
+                    lambdaSel = "CV",
+                    #timepoints = timepoint, 
+                    estpoints = seq(0, 1, length = 20), 
+                    bandwidth = bandwidth,
+                    lags = 1,
+                    beepvar = time_data$beep_var,
+                    dayvar = time_data$day_var,
+                    scale = TRUE,
+                    pbar = TRUE)
+
+# Overview how much data was used
+tvvar_obj
+
+
+# ----------------------------------------------------------------------------------
+# ----------------------- Reliability -------------------------------------------
+# ----------------------------------------------------------------------------------
+
+t1 <- proc.time()[3]
+
+res_obj <- resample(object = tvvar_obj, 
+                    data = mood_data, 
+                    nB = 50, 
+                    blocks = 10,
+                    seeds = 2:51, 
+                    quantiles = c(.05, .95))
+
+saveRDS(res_obj, file="res_obj_nB50_bw23-20est.RDS")
+res_obj <- readRDS(file="res_obj_nB50_bw23-20est.RDS")
+
+
+proc.time()[3] - t1 # Note that this takes a while
+
+res_obj$bootQuantiles[2, 2, 1, , 1]
+res_obj$bootQuantiles[2, 2, 1, , 2]
+
+
+# ----------------------------------------------------------------------------------
+# ----------------------- Predictability -------------------------------------------
+# ----------------------------------------------------------------------------------
+
+
+pred_obj <- predict(object = tvvar_obj, 
+                    data = mood_data, 
+                    errorCon = c("R2", "RMSE"),
+                    tvMethod = "weighted", 
+                    beepvar = time_data$beep_var,
+                    dayvar = time_data$day_var)
+
+# ----------------------------------------------------------------------------------
+# ----------------------- Visualization -----------------------------------------
+# ----------------------------------------------------------------------------------
+
+pred_obj$errors
+
+library(qgraph)
+
+# ----- Aux Functions ------
+
+# Function for timeline
+f_timeline_new <- function(length = .20, 
+                           gap = .005, 
+                           mar = c(0,0,0,0), 
+                           ylim = c(-.1,.1), 
+                           ytext = -.1,
+                           cex = 1) {
+  
+  
+  par(mar=mar)
+  plot.new()
+  plot.window(xlim=c(0,1), ylim=ylim)
+  # box()
+  
+  # arrows
+  p_weeks <- c(1,2,3,4)
+  bor_end <- c(0,cumsum(p_weeks)/sum(p_weeks))
+  for(i in 1:4) {
+    arrows(bor_end[i]+gap, 0, bor_end[i+1]-gap, code=3, length=length, lwd=1.5)
+  }
+  
+  # text
+  t_lengths <- p_weeks / sum(p_weeks)
+  midpoints <- bor_end[-1] - t_lengths/2
+  
+  text(midpoints, rep(ytext, 4), c("Baseline (1w)",
+                                   "Assessment @ (2w)",
+                                   "Assessment @ (3w)",
+                                   "Assessment @ (4w)"),
+       cex = cex)
+  
+  
+}
+
+
+# ----- Preprocessing  ------
+
+# Compute mean movel over time to create decent layout
+mean_wadj <- apply(tvvar_obj$wadj[, , 1, ], 1:2, mean)
+
+par_ests <- tvvar_obj$wadj
+ind_negative <- which(tvvar_obj$signs == -1, arr.ind = T)
+par_ests[ind_negative] <- par_ests[ind_negative] * -1
+
+# Find parameters with highest SD
+wadj_ws <- tvvar_obj$wadj
+wadj_ws[tvvar_obj$edgecolor=="red"] <- wadj_ws[tvvar_obj$edgecolor=="red"] * -1
+parm_sds <- apply(wadj_ws, 1:2, sd)
+parm_sds_mat <- matrix(NA, 11^2, 3)
+counter <- 1
+for(i in 1:11) {
+  for(j in 1:11) {
+    parm_sds_mat[counter, ] <- c(i, j, parm_sds[i, j]) 
+    counter <- counter + 1
+  }
+}
+
+parm_sds_mat_ord <- parm_sds_mat[order(parm_sds_mat[, 3], decreasing = TRUE), ]
+head(parm_sds_mat_ord) # six most time-varying parameters
+
+
+
+# ----- Plotting ------
+
+pdf(paste0(figDir, "FigureP001_Application_mgm-20estp_5_15_20.pdf"), width = 8, height = 7)
+# 1) Define Layout
+
+lmat <- matrix(c(1, 2, 3,
+                 4, 4, 4,
+                 5, 5, 5), ncol=3, byrow = T)
+lo <- layout(lmat, 
+             heights = c(.7,.1, .6), 
+             widths = c(1, 1, 1))
+
+
+# 2) Two Network Plots
+
+# Get layout of mean graph
+Q <- qgraph(t(mean_wadj), DoNotPlot=TRUE)
+saveRDS(Q$layout, "/Users/julianadam/Capstone 30.05.22/layoutRDS.mgm")
+Q$layout
+# Plot graph at selected fixed time points
+tpSelect <- c(5, 15, 20)
+tvvar_obj$wadj
+# Switch to colorblind scheme as indicated by Haslbeck
+tvvar_obj$edgecolor[, , , ][tvvar_obj$edgecolor[, , , ] == "darkgreen"] <- c("darkblue")
+lty_array <- array(1, dim=c(11, 11, 1, 20))
+lty_array[tvvar_obj$edgecolor[, , , ] != "darkblue"] <- 2
+tvvar_obj$wadj[, , 1, tp]
+for(tp in tpSelect)
+  qgraph(t(tvvar_obj$wadj[, , 1, tp]), 
+         layout = Q$layout,
+         edge.color = t(tvvar_obj$edgecolor[, , 1, tp]),
+         labels = mood_labels, 
+         vsize = 13, 
+         esize = 10,
+         asize = 10, 
+         mar = rep(5, 4), 
+         minimum = 0, 
+         maximum = .5, 
+         lty = t(lty_array[, , 1, tp]),
+         pie = pred_obj$tverrors[[tp]][,3])
+
+pred_obj$tverrors[[tp]][,3]
+
+# 4) Timeline
+f_timeline_new(length = .1, 
+               mar=c(0, 0, 0, 1), 
+               ylim = c(-1.2, .2), 
+               ytext = -.9, 
+               cex = 1)
+1
+# 5) Line-plots + CIs
+plot.new()
+par(mar = c(4,4,0,1))
+plot.window(xlim=c(1, 20), ylim=c(-.25, .60))
+axis(1, c(1, 5, 10, 15, 20), labels=T)
+axis(2, c(-.50, 0, .25, .5), las=2)
+abline(h = 0, col = "grey", lty=2)
+title(xlab = "Estimation points", cex.lab = 1.2)
+title(ylab = "Parameter estimate", cex.lab = 1.2)
+
+
+head(parm_sds_mat_ord) # chosing the three highest timevarying parameters
+m_par_display <- matrix(c(6, 6, 
+                          11, 6, 
+                          2,6), ncol = 2, byrow = T)
+
+# Selecting colors with the RColorBrewer and scales packages, also used by Haslbeck
+library(RColorBrewer)
+library(scales)
+cols <- brewer.pal(5, "Set1")[c(2,4,5)] # avoid red/green because used for edges in upper panel
+
+for(i in 1:nrow(m_par_display)) {
+  par_row <- m_par_display[i, ]
+  par_ests[par_row[1], par_row[2], 1,]
+  ## Plot point estimates
+  P1_pointest <- par_ests[par_row[1], par_row[2], 1, ]
+  lines(1:20, P1_pointest, col = cols[i], lwd = 2, lty=i) 
+  
+  
+  ## Plot uncertainty estimates with new shading
+  # Compute CIs
+  CIs <- apply(res_obj$bootParameters[par_row[1], par_row[2], 1, , ], 1, function(x) {
+    quantile(x, probs = c(.05, .95))
+  } )
+  
+  # Plot shading
+  polygon(x = c(1:20, 20:1), y = c(CIs[1,], rev(CIs[2,])), col=alpha(colour = cols[i], alpha = .3), border=FALSE)
+  
+  
+  
+} # end for: i
+
+# Legend
+legend_labels <- c(expression("Pressure"["t-1"]  %->%  "Pressure"["t"]),
+                   expression("Want to drink"["t-1"]  %->%  "Pressure"["t"]),
+                   expression("Comfortable"["t-1"]  %->%  "Pressure"["t"]))
+
+
+legend(1, .49, 
+       legend_labels,
+       col = cols, 
+       lwd = 2, bty = "n", cex = 0.95, horiz=T, lty=1:3)
+
+
+#---------------Plot Method 2 ---------------------
+#--------------------------------------------------
+
+par(mfrow=c(1,3))
+for(tp in c(3,7,16)) qgraph(t(tvvar_obj$wadj[, , 1, tp]), 
+                            layout = "circle",
+                            edge.color = t(tvvar_obj$edgecolor[, , 1, tp]), 
+                            labels = mood_labels, 
+                            mar = rep(5, 4), 
+                            vsize=15, esize=15, asize=13,
+                            maximum = .5, 
+                            pie = pred_obj$tverrors[[tp]][, 3] > 0,
+                            title = paste0("Estimation point = ", tp))
+
+
+# Obtain parameter estimates with sign
+par_ests <- tvvar_obj$wadj[, , 1, ]
+par_ests[tvvar_obj$edgecolor[, , 1, ]=="red"] <- par_ests[tvvar_obj$edgecolor[, , 1, ]=="red"] * -1
+
+# Select three parameters to plot
+#m_par_display <- matrix(c(10, 5, 
+                         # 8, 7, 
+                          #10, 8), ncol = 2, byrow = T)
+# Plotting
+plot.new()
+par(mar = c(4, 4, 0, 1))
+plot.window(xlim=c(1, 20), ylim=c(-.25, .55))
+axis(1, c(1, 5, 10, 20), labels = T)
+axis(2, c(-.25, 0, .50, .5), las = 2)
+abline(h = 0, col = "grey", lty = 2)
+title(xlab = "Estimation points", cex.lab = 1.2)
+title(ylab = "Parameter estimate", cex.lab = 1.2)
+
+for(i in 1:nrow(m_par_display)) {
+  par_row <- m_par_display[i, ]
+  P1_pointest <- par_ests[par_row[1], par_row[2], ]
+  lines(1:20, P1_pointest, lwd = 2, lty = i) 
+}
+
+legend_labels <- c(expression("Pressure"["t-1"]  %->%  "Pressure"["t"]),
+                   expression("Want to drink"["t-1"]  %->%  "Pressure"["t"]),
+                   expression("Comfortable"["t-1"]  %->%  "Pressure"["t"]))
+legend(1, .49, 
+       legend_labels,
+       lwd = 2, bty = "n", cex = 0.65, horiz = T, lty = 1:3)
+
+dev.off()
+
+# ----------------------------------------------------------------------------------
+# ----------------------- A) Time-varying or not? A Bootstrap test -----------------
+# ----------------------------------------------------------------------------------
+
+
+# ----- A) Fit once time-varying on actual data  -----------------------------------
+
+# Get RMSE from time-varying model
+pred_emp <- predict(object = tvvar_obj, 
+                    data = mood_data, 
+                    tvMethod = "closestModel")
+
+error_emp <- mean(pred_emp$errors$RMSE)
+
+
+
+# ----- B) Fit stationary model to be able to simulate data ------------------------
+
+var_obj <- mvar(data = mood_data,
+                type = rep("g", 11),
+                level = rep(1, 11), 
+                lambdaSel = "CV", 
+                lags = 1,
+                beepvar = time_data$beep_var,
+                dayvar = time_data$day_var,
+                scale = TRUE,
+                pbar = TRUE)
+
+# ----- C) Fit time-varying model to stationary data -------------------------------
+var_obj
+library(mlVAR)
+
+# Generate data
+n <- 116 #number of efficient data points, see above
+nIter <- 50
+
+l_data <- list()
+l_model <- list()
+l_meanerror <- rep(NA, nIter)
+
+# get parameters out of model object
+pars <- var_obj$wadj[, , 1]
+pars[var_obj$edgecolor=="red"] <- pars[var_obj$edgecolor=="red"] * -1
+intercepts <- unlist(var_obj$intercepts)
+
+for(i in 1:nIter) {
+  
+  l_data[[i]] <- simulateVAR(pars = pars, 
+                             means = intercepts, 
+                             Nt = n, 
+                             residuals = 1)  
+  
+  l_model[[i]] <- tvmvar(data = l_data[[i]],
+                         type = rep("g", 10),
+                         level = rep(1, 10), 
+                         lambdaSel = "CV",
+                         timepoints = 1:n, 
+                         estpoints = seq(0, 1, length = 20), 
+                         bandwidth = bandwidth,
+                         lags = 1,
+                         scale = TRUE,
+                         pbar = FALSE, 
+                         signInfo = FALSE)
+  
+  pred_res <- predict(object = l_model[[i]], 
+                      data = l_data[[i]], 
+                      tvMethod = "closestModel")
+  l_meanerror[i] <- mean(pred_res$errors$RMSE)
+  
+  print(i)
+
+} # end for: i
+
+
+saveRDS(l_model, file="l_model.RDS")
+saveRDS(l_meanerror, file="l_meanerror.RDS")
+
+
+# ----- D) Evaluate ----------------------------------------------------------------
+
+hist(l_meanerror, xlim=c(0.9, 1)) # sampling distribution under H0
+abline(v = error_emp, col="red") # empirical error
+
+# Conclusion: significant by essentially any alpha-level
+
+dev.off()
+
+
+
+
+
